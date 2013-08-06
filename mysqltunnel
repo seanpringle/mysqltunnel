@@ -1,0 +1,292 @@
+#!/bin/bash
+
+# MIT/X11 License
+# Copyright (c) 2013 Sean Pringle <sean.pringle@gmail.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+# mysqltunnel
+#
+# A simple ssh wrapper for the mysql client
+
+VERSION="v0.1"
+COPYRIGHT="2013 Sean Pringle"
+
+sshbin=$(which ssh)
+mysqlbin=$(which mysql)
+
+function msg {
+	echo "$@" 1>&2
+}
+
+# enum
+CONSTANTS=( \
+	MYDSN MYHOST MYPORT MYUSER MYPASS MYSOCK MYPAGER MYPROMPT \
+	SSHDSN SSHHOST SSHPORT \
+)
+tmp=${#CONSTANTS[@]}
+for ((i=0; i < $tmp; i++)); do
+    name=${CONSTANTS[i]}
+    declare -r ${name}=$i
+done
+
+# Defaults
+vars[$MYDSN]=''
+vars[$MYHOST]='127.0.0.1'
+vars[$MYPORT]='3306'
+vars[$MYUSER]=''
+vars[$MYPASS]=''
+vars[$MYSOCK]=''
+vars[$MYPAGER]=''
+vars[$MYPROMPT]=''
+vars[$SSHDSN]=''
+vars[$SSHHOST]=''
+vars[$SSHUSER]="$USER"
+vars[$SSHPORT]="22"
+
+# Parse ~/my.cnf for relevant stuff
+
+if [ -a ~/.my.cnf ]; then
+	ini=0
+	while read line; do
+
+		if [[ "$line" =~ \[mysql\] ]]; then
+			ini=1
+			continue
+		fi
+
+		if [[ "$line" =~ \[.*\] ]]; then
+			ini=0
+			continue
+		fi
+
+		if [ $ini -gt 0 ] && [[ "$line" =~ ^[[:space:]]*pager[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+			vars[$MYPAGER]=${BASH_REMATCH[1]}
+			continue
+		fi
+
+		if [ $ini -gt 0 ] && [[ "$line" =~ ^[[:space:]]*prompt[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+			vars[$MYPROMPT]=${BASH_REMATCH[1]}
+			continue
+		fi
+
+	done < ~/.my.cnf
+fi
+
+var=0
+sendargs=''
+
+for arg in "$@"
+do
+	if [ $var -gt 0 ]; then
+		vars[$var]="$arg"
+		var=0
+		continue
+	fi
+
+	# Support normal mysql client options
+	if [ "$arg" == "-h" ]; then
+		var=$MYHOST
+		continue
+	fi
+
+	if [ "$arg" == "-P" ]; then
+		var=$MYPORT
+		continue
+	fi
+
+	if [ "$arg" == "-u" ]; then
+		var=$MYUSER
+		continue
+	fi
+
+	# The original reason for custom argument parsing:
+	if [ "${arg:0:2}" == "-p" ] && [ -n "${arg:2}" ]; then
+		vars[$MYPASS]="${arg:2}"
+		continue
+	fi
+
+	# mysql://user:pass@host:port
+	if [[ "$arg" =~ ^mysql://.+$ ]]; then
+		vars[$MYDSN]="${arg:8}"
+		continue
+	fi
+
+	# Remote mysql socket path
+	if [[ "$arg" =~ ^--socket= ]]; then
+		vars[$MYSOCK]="${arg:9}"
+		continue
+	fi
+
+	# Pager
+	if [[ "$arg" =~ ^--pager= ]]; then
+		vars[$MYPAGER]="${arg:8}"
+		continue
+	fi
+
+	# Prompt
+	if [[ "$arg" =~ ^--prompt= ]]; then
+		vars[$MYPROMPT]="${arg:9}"
+		continue
+	fi
+
+	if [ "$arg" == "-sh" ]; then
+		var=$SSHHOST
+		continue
+	fi
+
+	if [ "$arg" == "-su" ]; then
+		var=$SSHUSER
+		continue
+	fi
+
+	if [ "$arg" == "-sP" ]; then
+		var=$SSHPORT
+		continue
+	fi
+
+	# ssh://user@host:port
+	if [[ "$arg" =~ ^ssh://.+$ ]]; then
+		vars[$SSHDSN]="${arg:6}"
+		continue
+	fi
+
+	# user@host:port
+	if [[ "$arg" =~ ^.+@.+$ ]]; then
+		vars[$SSHDSN]="$arg"
+		continue
+	fi
+
+	# Run mysqldump instead
+	# NOTE: Probably very slow!
+	if [ "$arg" == "--dump" ]; then
+		mysqlbin=$(which mysqldump)
+		continue
+	fi
+
+	sendargs="$sendargs '$arg'"
+done
+
+mydsn=${vars[$MYDSN]}
+myhost=${vars[$MYHOST]}
+myport=${vars[$MYPORT]}
+myuser=${vars[$MYUSER]}
+mypass=${vars[$MYPASS]}
+mysock=${vars[$MYSOCK]}
+mypager=${vars[$MYPAGER]}
+myprompt=${vars[$MYPROMPT]}
+sshdsn=${vars[$SSHDSN]}
+sshhost=${vars[$SSHHOST]}
+sshuser=${vars[$SSHUSER]}
+sshport=${vars[$SSHPORT]}
+
+# Temporary local port based on our PID
+lport=$(($$%1000+10000))
+
+# Extract mysql dsn
+if [[ "$mydsn" =~ ^([^:@]+)[:@] ]]; then
+	myuser=${BASH_REMATCH[1]}
+fi
+if [[ "$mydsn" =~ ^[^:@]*:([^@]+)@ ]]; then
+	mypass=${BASH_REMATCH[1]}
+fi
+if [[ "$mydsn" =~ ^.*@([^:]+) ]]; then
+	myhost=${BASH_REMATCH[1]}
+fi
+if [[ "$mydsn" =~ ^.*@[^:]+:([0-9]+)$ ]]; then
+	myport=${BASH_REMATCH[1]}
+fi
+
+# Extract ssh dsn
+if [[ "$sshdsn" =~ ^(.+)@ ]]; then
+	sshuser=${BASH_REMATCH[1]}
+fi
+if [[ "$sshdsn" =~ ^.*@([^:]+) ]]; then
+	sshhost=${BASH_REMATCH[1]}
+fi
+if [[ "$sshdsn" =~ ^.*@[^:]+:([0-9]+)$ ]]; then
+	sshport=${BASH_REMATCH[1]}
+fi
+
+if [ -z "$sshhost" ]; then
+	sshhost="$myhost"
+fi
+
+if [ -z "$myprompt" ]; then
+	tmp=$myhost
+	[ "$tmp" != "127.0.0.1" ] || tmp=$sshhost
+	myprompt="mysql $tmp \d> "
+fi
+
+sshcmd="$sshbin -f $sshuser@$sshhost -p $sshport -C -A -L $lport:$myhost:$myport"
+sshcmdrem="-N"
+
+# Use socat on server to connect mysql socket to forwarded tcp port
+if [ -n "$mysock" ]; then
+	sshcmd="$sshbin -f $sshuser@$sshhost -p $sshport -L $lport:127.0.0.1:$lport"
+	sshcmdrem="socat TCP-LISTEN:$lport,bind=localhost UNIX-CONNECT:$mysock"
+fi
+
+# Aim local mysql client at forwared tcp port
+mysqlcmd="$mysqlbin -h 127.0.0.1 -P $lport"
+if [ -n "$myuser" ]; then
+	mysqlcmd="$mysqlcmd -u $myuser"
+fi
+
+if [ -n "$mypager" ]; then
+	mysqlcmd="$mysqlcmd --pager='$mypager'"
+fi
+
+if [ -n "$myprompt" ]; then
+	mysqlcmd="$mysqlcmd --prompt='$myprompt'"
+fi
+
+# Keep mysql password separate to avoid printing it
+# TODO: How to hide the password from the process list?
+mysqlpass=''
+if [ -n "$mypass" ]; then
+	mysqlpass="-p$mypass"
+fi
+
+msg "mysqltunnel $VERSION (C) $COPYRIGHT, License MIT\X11"
+msg "mysql://$myuser@$myhost:$lport => ssh://$sshuser@$sshhost:$sshport"
+msg -n "tunneling: $sshcmd ..."
+
+if eval $sshcmd "$sshcmdrem"
+then
+	pid=$(ps -eo pid,args | grep "$sshcmd" | grep -v grep | cut -c1-6 | sed 's/\s*//g')
+	msg "ok (pid $pid)"
+
+	# socat takes a moment to setup
+	if [ -n "$mysock" ]; then
+		sleep 1s
+	fi
+
+	msg "connecting: $mysqlcmd $sendargs"
+	eval $mysqlcmd $mysqlpass $sendargs
+
+	# Kill the ssh tunnel
+	if [ -n "$pid" ]; then
+		kill $pid
+	fi
+else
+	msg "failed"
+fi
+
