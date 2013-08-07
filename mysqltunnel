@@ -40,6 +40,7 @@ function msg {
 CONSTANTS=( \
 	MYDSN MYHOST MYPORT MYUSER MYPASS MYSOCK MYPAGER MYPROMPT \
 	SSHDSN SSHHOST SSHPORT \
+	MODECLI MODEDUMP \
 )
 tmp=${#CONSTANTS[@]}
 for ((i=0; i < $tmp; i++)); do
@@ -60,6 +61,8 @@ vars[$SSHDSN]=''
 vars[$SSHHOST]=''
 vars[$SSHUSER]="$USER"
 vars[$SSHPORT]="22"
+
+mode=$MODECLI
 
 # Parse ~/my.cnf for relevant stuff
 
@@ -178,6 +181,7 @@ do
 	# NOTE: Probably very slow!
 	if [ "$arg" == "--dump" ]; then
 		mysqlbin=$(which mysqldump)
+		mode=$MODEDUMP
 		continue
 	fi
 
@@ -250,11 +254,11 @@ if [ -n "$myuser" ]; then
 	mysqlcmd="$mysqlcmd -u $myuser"
 fi
 
-if [ -n "$mypager" ]; then
+if [ $mode -eq $MODECLI ] && [ -n "$mypager" ]; then
 	mysqlcmd="$mysqlcmd --pager='$mypager'"
 fi
 
-if [ -n "$myprompt" ]; then
+if [ $mode -eq $MODECLI ] && [ -n "$myprompt" ]; then
 	mysqlcmd="$mysqlcmd --prompt='$myprompt'"
 fi
 
