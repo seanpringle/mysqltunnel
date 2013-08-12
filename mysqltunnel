@@ -29,9 +29,6 @@
 VERSION="v0.1"
 COPYRIGHT="2013 Sean Pringle"
 
-sshbin=$(which ssh)
-mysqlbin=$(which mysql)
-
 function msg {
 	echo "$@" 1>&2
 }
@@ -40,7 +37,7 @@ function msg {
 CONSTANTS=( \
 	MYDSN MYHOST MYPORT MYUSER MYPASS MYSOCK MYPAGER MYPROMPT \
 	SSHDSN SSHHOST SSHPORT \
-	MODECLI MODEDUMP \
+	MODECLI MODEDUMP MODEDUMP2 \
 )
 tmp=${#CONSTANTS[@]}
 for ((i=0; i < $tmp; i++)); do
@@ -180,8 +177,15 @@ do
 	# Run mysqldump instead
 	# NOTE: Probably very slow!
 	if [ "$arg" == "--dump" ]; then
-		mysqlbin=$(which mysqldump)
+		mysqlbin="mysqldump"
 		mode=$MODEDUMP
+		continue
+	fi
+
+	# Run remote mysqldump instead (usually faster)
+	if [ "$arg" == "--remotedump" ]; then
+		mysqlbin="mysqldump"
+		mode=$MODEDUMP2
 		continue
 	fi
 
@@ -239,19 +243,27 @@ if [ -z "$myprompt" ]; then
 	myprompt="mysql $tmp \d> "
 fi
 
-sshcmd="$sshbin -f $sshuser@$sshhost -p $sshport -C -A -L $lport:$myhost:$myport"
+sshflags="-C -A -c arcfour,blowfish-cbc"
+sshcmd="ssh -f $sshuser@$sshhost -p $sshport $sshflags -L $lport:$myhost:$myport"
 sshcmdrem="-N"
 
 # Use socat on server to connect mysql socket to forwarded tcp port
 if [ -n "$mysock" ]; then
-	sshcmd="$sshbin -f $sshuser@$sshhost -p $sshport -L $lport:127.0.0.1:$lport"
+	sshcmd="ssh -f $sshuser@$sshhost -p $sshport $sshflags -L $lport:127.0.0.1:$lport"
 	sshcmdrem="socat TCP-LISTEN:$lport,bind=localhost UNIX-CONNECT:$mysock"
 fi
 
 # Aim local mysql client at forwared tcp port
-mysqlcmd="$mysqlbin -h 127.0.0.1 -P $lport"
+mysqlcmd="mysql -h 127.0.0.1 -P $lport"
 if [ -n "$myuser" ]; then
 	mysqlcmd="$mysqlcmd -u $myuser"
+fi
+
+# Keep mysql password separate to avoid printing it
+# TODO: How to hide the password from the process list?
+mysqlpass=''
+if [ -n "$mypass" ]; then
+	mysqlpass="-p$mypass"
 fi
 
 if [ $mode -eq $MODECLI ] && [ -n "$mypager" ]; then
@@ -262,35 +274,43 @@ if [ $mode -eq $MODECLI ] && [ -n "$myprompt" ]; then
 	mysqlcmd="$mysqlcmd --prompt='$myprompt'"
 fi
 
-# Keep mysql password separate to avoid printing it
-# TODO: How to hide the password from the process list?
-mysqlpass=''
-if [ -n "$mypass" ]; then
-	mysqlpass="-p$mypass"
+if [ $mode -eq $MODEDUMP ]; then
+	mysqlcmd="$mysqlcmd --compress"
 fi
 
 msg "mysqltunnel $VERSION (C) $COPYRIGHT, License MIT\X11"
-msg "mysql://$myuser@$myhost:$lport => ssh://$sshuser@$sshhost:$sshport"
-msg -n "tunneling: $sshcmd ..."
 
-if eval $sshcmd "$sshcmdrem"
+if [ $mode -eq $MODECLI ] || [ $mode -eq $MODEDUMP ]
 then
-	pid=$(ps -eo pid,args | grep "$sshcmd" | grep -v grep | cut -c1-6 | sed 's/\s*//g')
-	msg "ok (pid $pid)"
+	msg "mysql://$myuser@$myhost:$lport => ssh://$sshuser@$sshhost:$sshport"
+	msg -n "tunneling: $sshcmd $sshcmdrem ..."
 
-	# socat takes a moment to setup
-	if [ -n "$mysock" ]; then
-		sleep 1s
-	fi
+	if eval $sshcmd "$sshcmdrem"
+	then
+		pid=$(ps -eo pid,args | grep "$sshcmd" | grep -v grep | cut -c1-6 | sed 's/\s*//g')
+		msg "ok (pid $pid)"
 
-	msg "connecting: $mysqlcmd $sendargs"
-	eval $mysqlcmd $mysqlpass $sendargs
+		# socat takes a moment to setup
+		if [ -n "$mysock" ]; then
+			sleep 1s
+		fi
 
-	# Kill the ssh tunnel
-	if [ -n "$pid" ]; then
-		kill $pid
+		msg "connecting: $mysqlcmd $sendargs"
+		eval $mysqlcmd $mysqlpass $sendargs
+
+		# Kill the ssh tunnel
+		if [ -n "$pid" ]; then
+			kill $pid
+		fi
+	else
+		msg "failed"
 	fi
 else
-	msg "failed"
+	# --remotedump runs mysqldump on the remote ssh server
+	# Not really a "tunnel" in this case, but its so much faster for big sql dumps...
+	# Requires mysqldump installed and in the $PATH on remote box
+	sshcmd="ssh $sshuser@$sshhost -p $sshport $sshflags"
+	sshcmdrem="mysqldump -h $myhost -P $myport -u $myuser $mysqlpass $sendargs"
+	msg -n "executing: $sshcmd $sshcmdrem"
+	eval $sshcmd "$sshcmdrem"
 fi
-
